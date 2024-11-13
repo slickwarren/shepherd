@@ -1,35 +1,21 @@
 package harvester
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 
-	"github.com/pkg/errors"
-	"github.com/rancher/norman/httperror"
 	frameworkDynamic "github.com/rancher/shepherd/clients/dynamic"
 	"github.com/rancher/shepherd/clients/rancher/catalog"
-	management "github.com/rancher/shepherd/clients/rancher/generated/management/v3"
 	v1 "github.com/rancher/shepherd/clients/rancher/v1"
 
-	kubeProvisioning "github.com/rancher/shepherd/clients/provisioning"
-	kubeRKE "github.com/rancher/shepherd/clients/rke"
 	"github.com/rancher/shepherd/pkg/clientbase"
 	"github.com/rancher/shepherd/pkg/config"
 	"github.com/rancher/shepherd/pkg/environmentflag"
 	"github.com/rancher/shepherd/pkg/session"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-// Client is the main harvester Client object that gives an end user access to the Provisioning and Management
+// Client is the main harvester Client object that gives an end user access to the Provisioning and Catalog
 // clients in order to create resources on harvester
 type Client struct {
 	// Client used to access Steve v1 API resources
@@ -40,7 +26,6 @@ type Client struct {
 	HarvesterConfig *Config
 	// Session is the session object used by the client to track all the resources being created by the client.
 	Session *session.Session
-	UserID  string
 
 	restConfig *rest.Config
 }
@@ -106,242 +91,11 @@ func clientOptsV1(restConfig *rest.Config, harvesterConfig *Config) *clientbase.
 	}
 }
 
-// doAction is used to post an action to an endpoint, and marshal the response into the output parameter.
-func (c *Client) doAction(endpoint, action string, body []byte, output interface{}) error {
-	url := "https://" + c.restConfig.Host + endpoint + "?action=" + action
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Add("Authorization", "Bearer "+c.restConfig.BearerToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.Steve.APIBaseClient.Ops.Client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return httperror.NewAPIErrorLong(resp.StatusCode, resp.Status, url)
-	}
-
-	byteContent, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if len(byteContent) > 0 {
-		err = json.Unmarshal(byteContent, output)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-	return fmt.Errorf("received empty response")
-}
-
-// AsUser accepts a user object, and then creates a token for said `user`. Then it instantiates and returns a Client using the token created.
-// This function uses the login action, and user must have a correct username and password combination.
-func (c *Client) AsUser(user *management.User) (*Client, error) {
-	returnedToken, err := c.login(user)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewClient(returnedToken.Token, c.Session)
-}
-
-// ReLogin reinstantiates a Client to update its API schema. This function would be used for a non admin user that needs to be
-// "reloaded" inorder to have updated permissions for certain resources.
-func (c *Client) ReLogin() (*Client, error) {
-	return NewClient(c.restConfig.BearerToken, c.Session)
-}
-
-// WithSession accepts a session.Session and instantiates a new Client to reference this new session.Session. The main purpose is to use it
-// when created "sub sessions" when tracking resources created at a test case scope.
-func (c *Client) WithSession(session *session.Session) (*Client, error) {
-	return NewClient(c.restConfig.BearerToken, session)
-}
-
-// GetClusterCatalogClient is a function that takes a clusterID and instantiates a catalog client to directly communicate with that specific cluster.
-func (c *Client) GetClusterCatalogClient(clusterID string) (*catalog.Client, error) {
-	restConfig := *c.restConfig
-	restConfig.Host = fmt.Sprintf("https://%s/k8s/clusters/%s", c.restConfig.Host, clusterID)
-
-	catalogClient, err := catalog.NewForConfig(&restConfig, c.Session)
-	if err != nil {
-		return nil, err
-	}
-
-	return catalogClient, nil
-}
-
-// GetRancherDynamicClient is a helper function that instantiates a dynamic client to communicate with the harvester host.
-func (c *Client) GetRancherDynamicClient() (dynamic.Interface, error) {
+// GetHarvesterDynamicClient is a helper function that instantiates a dynamic client to communicate with the harvester host.
+func (c *Client) GetHarvesterDynamicClient() (dynamic.Interface, error) {
 	dynamic, err := frameworkDynamic.NewForConfig(c.Session, c.restConfig)
 	if err != nil {
 		return nil, err
 	}
 	return dynamic, nil
-}
-
-// GetKubeAPIProvisioningClient is a function that instantiates a provisioning client that communicates with the Kube API of a cluster
-func (c *Client) GetKubeAPIProvisioningClient() (*kubeProvisioning.Client, error) {
-	provClient, err := kubeProvisioning.NewForConfig(c.restConfig, c.Session)
-	if err != nil {
-		return nil, err
-	}
-
-	return provClient, nil
-}
-
-// GetKubeAPIRKEClient is a function that instantiates a rke client that communicates with the Kube API of a cluster
-func (c *Client) GetKubeAPIRKEClient() (*kubeRKE.Client, error) {
-	rkeClient, err := kubeRKE.NewForConfig(c.restConfig, c.Session)
-	if err != nil {
-		return nil, err
-	}
-
-	return rkeClient, nil
-}
-
-// GetDownStreamClusterClient is a helper function that instantiates a dynamic client to communicate with a specific cluster.
-func (c *Client) GetDownStreamClusterClient(clusterID string) (dynamic.Interface, error) {
-	restConfig := *c.restConfig
-	restConfig.Host = fmt.Sprintf("https://%s/k8s/clusters/%s", c.restConfig.Host, clusterID)
-
-	dynamic, err := frameworkDynamic.NewForConfig(c.Session, &restConfig)
-	if err != nil {
-		return nil, err
-	}
-	return dynamic, nil
-}
-
-// SwitchContext is a helper function that changes the current context to `context` and instantiates a dynamic client
-func (c *Client) SwitchContext(context string, clientConfig *clientcmd.ClientConfig) (dynamic.Interface, error) {
-	overrides := clientcmd.ConfigOverrides{CurrentContext: context}
-
-	rawConfig, err := (*clientConfig).RawConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	updatedConfig := clientcmd.NewNonInteractiveClientConfig(rawConfig, rawConfig.CurrentContext, &overrides, (*clientConfig).ConfigAccess())
-
-	restConfig, err := updatedConfig.ClientConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	dynamic, err := frameworkDynamic.NewForConfig(c.Session, restConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	return dynamic, nil
-}
-
-// GetManagementWatchInterface is a functions used to get a watch.Interface from a resource created by the Management Client.
-// As is the Management resources do not have a watch.Interface, so therefore, the dynamic Client is used to get the watch.Interface.
-// The `schemaType` is a string that is found in different Management clients packages. Ex) management.ProjectType
-func (c *Client) GetManagementWatchInterface(schemaType string, opts metav1.ListOptions) (watch.Interface, error) {
-	schemaResource, ok := c.Steve.APIBaseClient.Ops.Types[schemaType]
-	if !ok {
-		return nil, errors.New("Unknown schema type [" + schemaType + "]")
-	}
-
-	groupVersionResource := schema.GroupVersionResource{
-		Group:    "management.cattle.io",
-		Version:  "v1",
-		Resource: schemaResource.PluralName,
-	}
-	dynamicClient, err := c.GetRancherDynamicClient()
-	if err != nil {
-		return nil, err
-	}
-
-	return dynamicClient.Resource(groupVersionResource).Watch(context.TODO(), opts)
-}
-
-// login uses the local authentication provider to authenticate a user and return the subsequent token.
-func (c *Client) login(user *management.User) (*management.Token, error) {
-	token := &management.Token{}
-	bodyContent, err := json.Marshal(struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}{
-		Username: user.Username,
-		Password: user.Password,
-	})
-	if err != nil {
-		return nil, err
-	}
-	err = c.doAction("/v3-public/localProviders/local", "login", bodyContent, token)
-	if err != nil {
-		return nil, err
-	}
-
-	return token, nil
-}
-
-// IsConnected is a helper function that pings harvester ping endpoint with the management, steve and rest clients.
-// Returns boolean value depending on if all the clients are able to get pong respond.
-func (c *Client) IsConnected() (isConnected bool, err error) {
-	mngmntPong, err := c.ping(c.Steve.APIBaseClient.Ops.Client)
-	if err != nil {
-		return
-	}
-
-	stevePong, err := c.ping(c.Steve.APIBaseClient.Ops.Client)
-	if err != nil {
-		return
-	}
-
-	restHTTP, err := rest.HTTPClientFor(c.restConfig)
-	if err != nil {
-		return false, err
-	}
-	restPong, err := c.ping(restHTTP)
-	if err != nil {
-		return
-	}
-
-	isConnected = mngmntPong == stevePong == restPong != isConnected
-	return
-}
-
-// ping uses http client to ping harvester ping endpoint, returns boolean value if pong is returned
-func (c *Client) ping(httpClient *http.Client) (bool, error) {
-	url := "https://" + c.restConfig.Host + "/ping"
-	pong := "pong"
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return false, err
-	}
-
-	req.Header.Add("Authorization", "Bearer "+c.restConfig.BearerToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return false, err
-	}
-
-	if resp != nil {
-		defer resp.Body.Close()
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return false, err
-		}
-		if len(bodyBytes) > 0 {
-			return string(bodyBytes) == pong, err
-		}
-	}
-
-	return false, err
 }
